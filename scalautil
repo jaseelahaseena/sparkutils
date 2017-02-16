@@ -1,0 +1,315 @@
+
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.hive.HiveContext
+import java.util.Calendar
+import org.apache.spark.sql.types
+import org.apache.spark.sql.functions._
+import scala.collection.mutable.ArrayBuffer
+import scala.collection.mutable.WrappedArray
+import java.text.SimpleDateFormat
+import java.io._
+import scala.math.log10;
+import scala.math.pow;
+import scala.math.round;
+import scala.math.min;
+import scala.math.max;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import scala.util.control._
+import org.apache.hadoop.hive.ql.exec.UDF;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileSystem, Path};
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FSDataOutputStream;
+
+/** Scala utility functions**/
+  
+object scalautil {
+
+  /** Global variables and constants **/
+
+  // Global HDFS root table data location
+  val globalHiveTableRoot = "/user/env/hiveDbTmpDir"
+  val outputDir = "user/env"
+  
+  /** Convert string array to string - delimiter seperated  **/
+  def f_stringArrayToString(args1: WrappedArray[String], delimiter: String = " "): String = {
+    val Concatstr = args1.mkString(delimiter)
+    return Concatstr
+  }
+  
+   /**  Convert Long array to string - delimiter seperated **/
+  def f_LongArrayToString(args1: WrappedArray[Long], delimiter: String = " "): String = {
+    val Concatstr = args1.mkString(delimiter)
+    return Concatstr
+  }
+  
+  /** NVL function lets you substitute a value when a null value is encountered **/
+
+  def NVL[T](input: T, replaceWith: T): T = input match {
+    case null => replaceWith
+    case 0    => replaceWith
+    case _    => input
+  }
+
+  /** Build a delimited list from a single column data frame **/
+
+  def f_list_agg(inputDF: DataFrame, delimiter: String = " "): String = {
+    if (inputDF.head().size == 1) {
+      inputDF.map(x => x(0)).collect().mkString(delimiter)
+    } else {
+      null
+    }
+  }
+
+  /** Returns the week number for a date **/
+
+  def f_get_week_id(pDate: java.util.Date = Calendar.getInstance().getTime()): Int = {
+    val cal = Calendar.getInstance()
+    cal.setTime(pDate)
+    cal.get(Calendar.WEEK_OF_YEAR) + 889
+  }
+
+  /** Get next sequence number **/
+
+  def seq_nextval(): Long = {
+    val factor = 10
+    val timestamp: Long = System.currentTimeMillis / factor
+    timestamp
+  }
+
+  /** Validate if Hive database exists **/
+
+  def validateDB(dbName: String)(hiveContext: HiveContext): Boolean = {
+    val lDbCount = hiveContext.sql(s" SHOW DATABASES LIKE '$dbName' ").count
+    if (lDbCount == 0L) { false } else { true }
+  }
+
+  /** populate null in select clause for insert query is only for a few columns **/
+  def populateNullInSelect(tableName:String, populatedCols:String, populatedColVals:String)(hiveContext:HiveContext) = {
+    val tableColsDf = hiveContext.sql(s"""show columns from $tableName""")
+    var colsArr = populatedCols.split(",")
+    var parenthesesCounter:Int=0;
+    var dblQuotesCounter:Boolean = false;
+    var singleQuotesCounter:Boolean = false
+    var tokens: ArrayBuffer[String] = ArrayBuffer()
+    var buffer:StringBuffer = new StringBuffer("")
+    for (c <- populatedColVals){
+      if (c=='(') parenthesesCounter+=1;
+      if (c==')') parenthesesCounter-=1;
+      if (c==''') if ( singleQuotesCounter ) singleQuotesCounter = false else singleQuotesCounter = true
+      if (c=='"') if ( dblQuotesCounter ) dblQuotesCounter = false else dblQuotesCounter = true
+      if (c==',' && parenthesesCounter==0 && !dblQuotesCounter && !singleQuotesCounter){
+        //lets add token inside buffer to our tokens
+        tokens += buffer.toString()
+        //now we need to clear buffer  
+        buffer = new StringBuffer("")
+      }
+      else 
+        buffer.append(c);
+    }
+    tokens += buffer.toString()
+
+    var colsValArr = tokens
+    var colsColValArr = colsArr.zip(colsValArr)
+    var finalOut = tableColsDf.map{ x=> {colsColValArr.find(y => y._1.trim.equalsIgnoreCase(x.getString(0).trim)) match {
+      case Some(value) => value._2
+      case None => "NULL "
+      }
+    }}.collect.mkString(",")
+    finalOut
+  }
+
+  /** convert oracle insert into hive format **/
+  def convertOracleQtoHive(insertQuery: String)(hiveContext:HiveContext): String = {
+    var gTabQuery = "";
+    var reg = """^\s*INSERT\s+(INTO|OVERWRITE)\s+TABLE\s+(.*)\s+\((.*)\)\s+SELECT\s+(.*?)\s+FROM\s+(.*)$""".r
+    try {
+      gTabQuery = insertQuery.stripMargin.replaceAll("\n", " ")
+      var reg(into, tableName, populatedCols, populatedColsVal, selectQuery) = gTabQuery
+      var selectClause = populateNullInSelect(tableName, populatedCols, populatedColsVal)(hiveContext)
+      gTabQuery = s"""INSERT $into TABLE $tableName SELECT $selectClause FROM $selectQuery""".stripMargin.replaceAll("\n", " ")
+    } catch {
+      case ex: Throwable => {
+        println("Failed to parse SQL statement. Submitted : " + insertQuery)
+      }
+    }
+    gTabQuery
+  }  
+ 
+  /** Insert records into a table **/
+   def PARTITION_INSERT(lSqlStmnt: String, targetTab: String, partitionCol: String)(hiveContext: HiveContext): Long =
+    {
+      val lInsertDf = hiveContext.sql(lSqlStmnt)
+      lInsertDf.registerTempTable("Insert_Temp_table")
+      var tempTable = "Insert_Temp_table"
+      var hiveInsertStat: String = null;
+      var tableColumns: String = f_list_agg(hiveContext.sql(s"""show columns FROM ${targetTab}"""), ",")
+      hiveInsertStat = "INSERT INTO TABLE " + targetTab + " PARTITION (" + partitionCol + ") " + " SELECT " + tableColumns + " FROM " + tempTable
+      hiveContext.sql("set hive.exec.dynamic.partition.mode=nonstrict")
+      val count = hiveContext.sql(hiveInsertStat)
+      return lInsertDf.count()
+    }
+
+    // To write log file in HDFS directly
+    def p_manage_logging(logTabs: ArrayBuffer[String], pfilename: String) 
+    {
+      val today = Calendar.getInstance().getTime()
+      val curTimeFormat = new SimpleDateFormat("dd/MM/yy HH:mm:ss")
+      val curTimeStamp = new SimpleDateFormat("yyyyMMdd_hhmmss")
+      val conf = new Configuration()
+      conf.set("dfs.support.append", "true")
+      val fs = org.apache.hadoop.fs.FileSystem.get(conf)
+      val fileSystem = org.apache.hadoop.fs.FileSystem.get(conf)
+      var lmsg: String = "null"
+      for (lloop <- logTabs) 
+      {
+        if (lmsg == "null") 
+        {
+          lmsg = lloop
+        }
+        else 
+        {
+          lmsg = lmsg + "  |" + lloop
+        }
+      }
+      try
+      {
+      if(fileSystem.exists(new org.apache.hadoop.fs.Path(s"hdfs://nameservice1/$outputDir/logs/$pfilename")).equals(true))
+      {
+        val outputStream = fileSystem.append(new org.apache.hadoop.fs.Path(s"hdfs://nameservice1/$outputDir/logs/$pfilename"))
+        val bufferedWriter = new BufferedWriter(new OutputStreamWriter(outputStream))
+        bufferedWriter.write("\n" + curTimeFormat.format(today) + " " +lmsg)
+        bufferedWriter.close()
+      }
+      else
+      {
+        val out = fs.create(new org.apache.hadoop.fs.Path(s"hdfs://nameservice1/$outputDir/logs/$pfilename"),true)
+        val bufferedWriter = new BufferedWriter(new OutputStreamWriter(out))
+        bufferedWriter.write("\n" + curTimeFormat.format(today) + " " +lmsg)
+        bufferedWriter.close()
+      }
+      }
+      catch
+      {
+        case e:Exception=>
+        e.printStackTrace()
+      }
+      
+    }
+  
+  /** Replaceent for F_ROUND_PCT orace function **/
+  
+  def f_round_pct(numeric_value:Double,pct:Double):Double= {
+    
+    def truncateAt(n: Double, p: Double): Double = { val s = math pow (10, p); (math floor n * s) / s }
+
+          var lPwr_10:Double=0.0
+          var lInterv:Double=0.0
+          var lValueLow:Double=0.0
+          var lValueHigh:Double=0.0
+          var lResult:Double=0.0
+      
+          if(numeric_value == 0)
+          {
+              lResult
+          }
+          else
+          {
+            var log10num = (log10(numeric_value)/log10(10D))
+            if(log10num <0)
+            {
+              //lPwr_10 = pow(10,round(log(numeric_value) -1))
+               lPwr_10 = pow(10D,truncateAt(((log10(numeric_value)/log10(10D))-1),0))
+                  //print("IF"+lPwr_10)
+            }
+            else
+            {
+               lPwr_10 = pow(10D,truncateAt(log10(numeric_value)/log10(10D),0))
+                  //print(lPwr_10)
+
+            }
+          
+      var lInterv = truncateAt((numeric_value/lPwr_10),0)*lPwr_10*(pct*2)/100
+      //print("OP"+lInterv)
+      var lValueLow = max(truncateAt((numeric_value/lPwr_10),0)*lPwr_10, truncateAt((numeric_value/(lInterv)),0)*lInterv);
+      //print("MAX"+lValueLow)
+      var lValueHigh = min((truncateAt((numeric_value/lPwr_10),0)+1)*lPwr_10, truncateAt((numeric_value/lInterv+1),0)*lInterv);
+      //print("MIN"+lValueHigh)
+      var lowLim = numeric_value - lValueLow
+      var highLim = lValueHigh-numeric_value
+      if (lowLim < highLim)
+      {
+        lResult = lValueLow
+      } else
+      {
+        lResult = lValueHigh
+      }
+
+      /*def f1(numeric_value:Double,lValueLow:Double ): Double= (numeric_value-lValueLow) < (lValueHigh-numeric_value)  match {
+      case  true => lValueLow
+      case  false => lValueHigh
+      }*/
+  
+      return lResult
+    }
+  }
+
+  /**Return the count of the search string in the destination string*/
+   
+  def f_regexp_count(str: String, str1: String, pos: Int): Int = {
+    var cnt = 0
+    var s = 0
+    var strToChar = str1.toCharArray()
+    var value = strToChar(0)
+    if (str.contains(str1)) {
+      var tochar = str.toCharArray()
+      for (i <- 0 to tochar.length - 1) {
+        s = tochar(i)
+        if ((i + 1) > pos) {
+          if (tochar(i) == value) {
+            cnt = cnt + 1
+
+          }
+        }
+      }
+
+    }
+    return cnt
+  }
+
+   /**Return the position of the search string in the destination string*/
+  def f_inString(str: String, str1: String, num1: Int, num2: Int): Int = {
+
+    var i: Int = 0;
+    var res: Int = 0;
+    var result: Int = 0
+    var loop = new Breaks()
+    if(str == null || str1 == null){
+       return result
+    }
+    if (str.contains(str1)) {
+      val p: Pattern = Pattern.compile(str1);
+      val m: Matcher = p.matcher(str);
+      loop.breakable {
+        while (m.find()) {
+          i = i + 1
+          if (num2 == i) {
+
+            res = m.start() + str1.length() - num1 + 1;
+            loop.break;
+
+          } else {
+          }
+        }
+      }
+      result = new Integer(res)
+    }
+    println(result)
+    return result
+  }
+}
+
+    
+

@@ -1,0 +1,52 @@
+Spark best practices:
+
+1. Do cache or persist data frames in order to utilise the memory in case of iterative scenarios.
+They help saving interim partial results so they can be reused in subsequent stages especially while using in Actions.
+
+Cache judiciously : Use the cache or persist depends on how many times the dataset is accessed and the amount of work involved.
+Sometimes re computation can be faster than the price paid by the increased memory pressure.
+
+2. Join is one of the most expensive operations you will commonly use in Spark, so it is worth doing what you can to shrink your data before performing a join.
+
+3. The --num-executors command-line property control the number of executors requested. Please size the executor memory according to the cluster and node configuration
+
+Starting in Spark 1.3 onwards, we can able to avoid setting this property by turning on dynamic allocation with the spark.dynamicAllocation.enabled property. 
+Dynamic allocation enables a Spark application to request executors when there is a backlog of pending tasks and free up executors when idle.
+Disable Spark dynamic allocation if you don’t want Spark applications using all available resources on your cluster.
+
+4. Avoid GroupByKey- The reduceByKey works much better on a large dataset since group by key requires more shuffling than reduce by key.
+
+5. Avoiding shuffle will make spark program run faster. All shuffle data must be written to disk and then transferred over the network. Each time that you generate a shuffling shall be generated a new stage. So between a stage and another having a shuffling
+
+ - repartition, join, cogroup, and any of the *By or *ByKey transformations can result in shuffles.
+ - map, filter and union generate a only stage (no shuffling).
+ - Use the built in aggregateByKey() operator instead of writing your own aggregations.
+ - Filter input earlier in the program rather than later.
+
+6. Avoid reduceByKey when the input and output value types are different
+
+7. Don't copy all elements of a large RDD to the driver in this case all of these elements wont fit in the driver machine and can result in a memory of exception.
+
+eg: Collect on larger datasets
+ val values = largeRDD.collect()
+ Instead make sure the number of elements return is capped by calling take or takeSample, or perhaps filtering or sampling our RDD.
+
+8. Avoid re-implementing existing functionality as it’s guaranteed to be slower. 
+  Eg: In RDD we can use isEmpty() 
+  def isEmpty(): Boolean = withScope {
+    partitions.length == 0 || take(1).length == 0
+  }
+  
+9.  Use UDF to define custom functions.
+  
+10. Use the right level of parallelism.
+
+ To tune the level of parallelism:
+ - Specify the number of partitions, when we call operations that shuffle data, for example, reduceByKey.
+ - Redistribute the data in the RDD. This can be done by increasing or decreasing the number of partitions.
+ - Use repartition() method to specify the number of partitions or coalesce() to decrease the number of partitions.
+ - Use coalesce if we decrease number of partition of the RDD instead of repartition. coalesce is useful because its not shuffle data over network.
+ - Do Hash-partition before transformation over pair RDD:  
+   When using Hash-partition the data will be shuffle and all same key data will shuffle at same worker 
+eg: val wordPairsRDD = rdd.map(word => (word, 1)).
+                   partitonBy(new HashPartition(4)).reduceByKey(_ + _).collect()
